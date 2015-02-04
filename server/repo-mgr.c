@@ -388,14 +388,10 @@ out:
 }
 
 static int
-remove_repo_ondisk (SeafRepoManager *mgr,
-                    const char *repo_id,
-                    gboolean add_deleted_record)
+remove_virtual_repo_ondisk (SeafRepoManager *mgr,
+                            const char *repo_id)
 {
     SeafDB *db = mgr->seaf->db;
-
-    if (add_deleted_record)
-        add_deleted_repo_record (mgr, repo_id);
 
     /* Remove record in repo table first.
      * Once this is commited, we can gc the other tables later even if
@@ -403,9 +399,6 @@ remove_repo_ondisk (SeafRepoManager *mgr,
      */
     if (seaf_db_statement_query (db, "DELETE FROM Repo WHERE repo_id = ?",
                                  1, "string", repo_id) < 0)
-        return -1;
-
-    if (add_deleted_repo_to_trash (mgr, repo_id) == -1)
         return -1;
 
     /* remove branch */
@@ -436,29 +429,53 @@ remove_repo_ondisk (SeafRepoManager *mgr,
     seaf_db_statement_query (db, "DELETE FROM RepoUserToken WHERE repo_id = ?",
                              1, "string", repo_id);
 
-    /* Remove virtual repos when origin repo is deleted. */
-    GList *vrepos, *ptr;
-    vrepos = seaf_repo_manager_get_virtual_repo_ids_by_origin (mgr, repo_id);
-    for (ptr = vrepos; ptr != NULL; ptr = ptr->next)
-        remove_repo_ondisk (mgr, (char *)ptr->data, FALSE);
-    string_list_free (vrepos);
-
-    seaf_db_statement_query (db, "DELETE FROM VirtualRepo "
-                             "WHERE repo_id=? OR origin_repo=?",
-                             2, "string", repo_id, "string", repo_id);
-
     return 0;
 }
 
 int
 seaf_repo_manager_del_repo (SeafRepoManager *mgr,
-                            const char *repo_id,
-                            gboolean add_deleted_record)
+                            const char *repo_id)
 {
-    if (remove_repo_ondisk (mgr, repo_id, add_deleted_record) < 0)
+    if (seaf_db_statement_query (mgr->seaf->db, "DELETE FROM Repo WHERE repo_id = ?",
+                                 1, "string", repo_id) < 0)
         return -1;
 
-    return 0;
+    seaf_db_statement_query (mgr->seaf->db, "DELETE FROM SharedRepo WHERE repo_id = ?",
+                             1, "string", repo_id);
+
+    seaf_db_statement_query (mgr->seaf->db, "DELETE FROM RepoGroup WHERE repo_id = ?",
+                             1, "string", repo_id);
+
+    if (!seaf->cloud_mode) {
+        seaf_db_statement_query (mgr->seaf->db, "DELETE FROM InnerPubRepo WHERE repo_id = ?",
+                                 1, "string", repo_id);
+    }
+
+    seaf_db_statement_query (mgr->seaf->db, "DELETE FROM RepoUserToken WHERE repo_id = ?",
+                             1, "string", repo_id);
+
+    /* Remove virtual repos when origin repo is deleted. */
+    GList *vrepos, *ptr;
+    vrepos = seaf_repo_manager_get_virtual_repo_ids_by_origin (mgr, repo_id);
+    for (ptr = vrepos; ptr != NULL; ptr = ptr->next)
+        remove_virtual_repo_ondisk (mgr, (char *)ptr->data);
+    string_list_free (vrepos);
+
+    seaf_db_statement_query (mgr->seaf->db, "DELETE FROM VirtualRepo "
+                             "WHERE repo_id=? OR origin_repo=?",
+                             2, "string", repo_id, "string", repo_id);
+
+
+    int ret = add_deleted_repo_to_trash (mgr, repo_id);
+
+    return ret;
+}
+
+int
+seaf_repo_manager_del_virtual_repo (SeafRepoManager *mgr,
+                                    const char *repo_id)
+{
+    return remove_virtual_repo_ondisk (mgr, repo_id);
 }
 
 static gboolean
@@ -1752,7 +1769,10 @@ seaf_repo_manager_get_repo_ids_by_owner (SeafRepoManager *mgr,
 }
 
 GList *
-seaf_repo_manager_get_trash_repo_list (SeafRepoManager *mgr, int start, int limit)
+seaf_repo_manager_get_trash_repo_list (SeafRepoManager *mgr,
+                                       int start,
+                                       int limit,
+                                       GError **error)
 {
     GList *trash_repos = NULL;
     int rc;
@@ -1769,10 +1789,84 @@ seaf_repo_manager_get_trash_repo_list (SeafRepoManager *mgr, int start, int limi
                                             collect_trash_repo, &trash_repos,
                                             2, "int", limit, "int", start);
 
-    if (rc < 0)
+    if (rc < 0) {
+        while (trash_repos) {
+            g_object_unref (trash_repos->data);
+            trash_repos = g_list_delete_link (trash_repos, trash_repos);
+        }
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "Failed to get trashed repo from db.");
         return NULL;
+    }
 
     return trash_repos;
+}
+
+int
+seaf_repo_manager_del_repo_from_trash (SeafRepoManager *mgr,
+                                       const char *repo_id,
+                                       GError **error)
+{
+    int ret = 0;
+
+    ret = seaf_db_statement_query (mgr->seaf->db,
+                                   "DELETE FROM RepoTrash WHERE repo_id = ?",
+                                   1, "string", repo_id);
+    if (ret < 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "DB error: delete from RepoTrash.");
+        return -1;
+    }
+
+    add_deleted_repo_record (mgr, repo_id);
+
+    /* remove branch */
+    GList *p;
+    GList *branch_list = seaf_branch_manager_get_branch_list (seaf->branch_mgr, repo_id);
+    for (p = branch_list; p; p = p->next) {
+        SeafBranch *b = (SeafBranch *)p->data;
+        seaf_repo_manager_branch_repo_unmap (mgr, b);
+        seaf_branch_manager_del_branch (seaf->branch_mgr, repo_id, b->name);
+    }
+    seaf_branch_list_free (branch_list);
+
+    ret = seaf_db_statement_query (mgr->seaf->db, "DELETE FROM RepoOwner WHERE repo_id = ?",
+                                   1, "string", repo_id);
+    if (ret < 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "DB error: delete from RepoOwner.");
+        return -1;
+    }
+
+    return ret;
+}
+
+int
+seaf_repo_manager_restore_repo_from_trash (SeafRepoManager *mgr,
+                                           const char *repo_id,
+                                           GError **error)
+{
+    int ret = 0;
+
+    ret = seaf_db_statement_query (mgr->seaf->db,
+                                   "DELETE FROM RepoTrash WHERE repo_id = ?",
+                                   1, "string", repo_id);
+    if (ret < 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "DB error: delete from RepoTrash.");
+        return -1;
+    }
+
+    ret = seaf_db_statement_query (mgr->seaf->db,
+                                   "INSERT INTO Repo(repo_id) VALUES (?)",
+                                   1, "string", repo_id) < 0;
+    if (ret < 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "DB error: Insert Repo.");
+        return -1;
+    }
+
+    return ret;
 }
 
 /* Web access permission. */
